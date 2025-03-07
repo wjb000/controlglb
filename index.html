@@ -1,0 +1,404 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>3D Character Viewer</title>
+    <style>
+        body { 
+            margin: 0; 
+            overflow: hidden; 
+        }
+        canvas { 
+            display: block; 
+        }
+        #instructions {
+            position: absolute;
+            top: 10px;
+            left: 10px;
+            background: rgba(0,0,0,0.5);
+            color: white;
+            padding: 10px;
+            font-family: Arial, sans-serif;
+            border-radius: 5px;
+        }
+    </style>
+</head>
+<body>
+    <div id="instructions">
+        WASD - Move<br>
+        SPACE - Jump<br>
+        SHIFT - Sprint<br>
+        MOUSE - Look around<br>
+        CLICK - Lock/Unlock mouse
+    </div>
+
+    <script type="importmap">
+        {
+            "imports": {
+                "three": "https://unpkg.com/three@0.160.0/build/three.module.js",
+                "three/addons/": "https://unpkg.com/three@0.160.0/examples/jsm/"
+            }
+        }
+    </script>
+    <script type="module">
+        import * as THREE from 'three';
+        import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
+        import { DRACOLoader } from 'three/addons/loaders/DRACOLoader.js';
+
+        // Create scene
+        const scene = new THREE.Scene();
+        scene.background = new THREE.Color(0x87ceeb);
+
+        // Add ground plane
+        const groundGeometry = new THREE.PlaneGeometry(100, 100);
+        const groundMaterial = new THREE.MeshStandardMaterial({ 
+            color: 0x7cfc00,
+            roughness: 0.8,
+            metalness: 0.2
+        });
+        const ground = new THREE.Mesh(groundGeometry, groundMaterial);
+        ground.rotation.x = -Math.PI / 2;
+        ground.receiveShadow = true;
+        scene.add(ground);
+
+        // Create camera
+        const camera = new THREE.PerspectiveCamera(75, window.innerWidth / window.innerHeight, 0.1, 1000);
+        camera.position.set(0, 2, 5);
+
+        // Create renderer
+        const renderer = new THREE.WebGLRenderer({ antialias: true });
+        renderer.setSize(window.innerWidth, window.innerHeight);
+        renderer.setPixelRatio(window.devicePixelRatio);
+        renderer.outputColorSpace = THREE.SRGBColorSpace;
+        renderer.shadowMap.enabled = true;
+        document.body.appendChild(renderer.domElement);
+
+        // Add lights
+        const ambientLight = new THREE.AmbientLight(0xffffff, 0.8);
+        scene.add(ambientLight);
+
+        const directionalLight = new THREE.DirectionalLight(0xffffff, 1.0);
+        directionalLight.position.set(5, 10, 5);
+        directionalLight.castShadow = true;
+        directionalLight.shadow.mapSize.width = 1024;
+        directionalLight.shadow.mapSize.height = 1024;
+        scene.add(directionalLight);
+
+        // Character controller settings
+        const characterControls = {
+            moveSpeed: 0.1,
+            sprintMultiplier: 2,
+            jumpForce: 0.3,
+            gravity: 0.01,
+            airControl: 0.3,
+            friction: 0.9,
+            linearDamping: 0.95,
+            groundDetectionRayLength: 1.5,
+            groundOffset: 0.1,
+            cameraHeight: 1.8,
+            cameraDistance: 3,
+            cameraSmoothing: 0.1,
+            lookAtHeight: 1.0,
+            mouseSensitivity: 0.002
+        };
+
+        // Character state
+        const character = {
+            model: null,
+            mixer: null,
+            animations: {},
+            currentAnimation: null,
+            position: new THREE.Vector3(0, 1, 0),
+            velocity: new THREE.Vector3(0, 0, 0),
+            rotation: 0,
+            isGrounded: false,
+            isMoving: false,
+            isSprinting: false,
+            isJumping: false,
+            previousState: null // Added to track state changes
+        };
+
+        // Camera state
+        const cameraState = {
+            rotation: { x: 0, y: 0 },
+            targetPosition: new THREE.Vector3(),
+            isLocked: false
+        };
+
+        // Input state
+        const keys = {
+            forward: false,
+            backward: false,
+            left: false,
+            right: false,
+            jump: false,
+            sprint: false
+        };
+
+        // Set up Draco loader
+        const dracoLoader = new DRACOLoader();
+        dracoLoader.setDecoderPath('https://unpkg.com/three@0.160.0/examples/jsm/libs/draco/');
+        
+        // Load GLB model
+        const loader = new GLTFLoader();
+        loader.setDRACOLoader(dracoLoader);
+        
+        loader.load(
+            'character.glb',
+            function (gltf) {
+                character.model = gltf.scene;
+                
+                const box = new THREE.Box3().setFromObject(character.model);
+                const center = box.getCenter(new THREE.Vector3());
+                character.model.position.x = -center.x;
+                character.model.position.z = -center.z;
+                
+                const size = box.getSize(new THREE.Vector3());
+                const maxDim = Math.max(size.x, size.y, size.z);
+                if (maxDim > 2) {
+                    const scale = 2 / maxDim;
+                    character.model.scale.set(scale, scale, scale);
+                }
+                
+                character.model.position.copy(character.position);
+                
+                character.model.traverse(function(node) {
+                    if (node.isMesh) {
+                        node.castShadow = true;
+                        node.receiveShadow = true;
+                    }
+                });
+                
+                scene.add(character.model);
+                
+                if (gltf.animations && gltf.animations.length) {
+                    character.mixer = new THREE.AnimationMixer(character.model);
+                    gltf.animations.forEach((clip) => {
+                        const name = clip.name.toUpperCase();
+                        character.animations[name] = character.mixer.clipAction(clip);
+                        character.animations[name].setLoop(THREE.LoopRepeat);
+                    });
+                    
+                    // Start with idle animation if available
+                    if (character.animations['IDLE']) {
+                        character.animations['IDLE'].play();
+                        character.currentAnimation = 'IDLE';
+                    } else if (gltf.animations.length > 0) {
+                        // Fallback to first animation
+                        const firstAnim = gltf.animations[0].name.toUpperCase();
+                        character.animations[firstAnim].play();
+                        character.currentAnimation = firstAnim;
+                    }
+                }
+                
+                updateCameraPosition();
+            },
+            null,
+            function (error) {
+                console.error('Error loading model:', error);
+            }
+        );
+
+        // Input handling
+        document.addEventListener('keydown', function(event) {
+            switch(event.code) {
+                case 'KeyW': keys.forward = true; break;
+                case 'KeyS': keys.backward = true; break;
+                case 'KeyA': keys.left = true; break;
+                case 'KeyD': keys.right = true; break;
+                case 'Space': 
+                    if (!event.repeat) keys.jump = true; 
+                    break;
+                case 'ShiftLeft': keys.sprint = true; break;
+            }
+        });
+
+        document.addEventListener('keyup', function(event) {
+            switch(event.code) {
+                case 'KeyW': keys.forward = false; break;
+                case 'KeyS': keys.backward = false; break;
+                case 'KeyA': keys.left = false; break;
+                case 'KeyD': keys.right = false; break;
+                case 'Space': keys.jump = false; break;
+                case 'ShiftLeft': keys.sprint = false; break;
+            }
+        });
+
+        document.addEventListener('click', function() {
+            if (!cameraState.isLocked) {
+                renderer.domElement.requestPointerLock();
+            } else {
+                document.exitPointerLock();
+            }
+        });
+
+        document.addEventListener('pointerlockchange', function() {
+            cameraState.isLocked = document.pointerLockElement === renderer.domElement;
+        });
+
+        document.addEventListener('mousemove', function(event) {
+            if (cameraState.isLocked) {
+                cameraState.rotation.y -= event.movementX * characterControls.mouseSensitivity;
+                cameraState.rotation.x -= event.movementY * characterControls.mouseSensitivity;
+                cameraState.rotation.x = Math.max(-Math.PI/2.5, Math.min(Math.PI/2.5, cameraState.rotation.x));
+            }
+        });
+
+        function setAnimation(animName) {
+            if (!character.mixer || !character.animations[animName]) {
+                return;
+            }
+            
+            // Only change animation if it's different or sprint state changed
+            if (character.currentAnimation !== animName || 
+                (animName === 'RUN' && character.previousState !== character.isSprinting)) {
+                const prevAnim = character.animations[character.currentAnimation];
+                const nextAnim = character.animations[animName];
+                
+                nextAnim.reset().fadeIn(0.2).play();
+                nextAnim.timeScale = (animName === 'RUN' && character.isSprinting) ? 1.25 : 1;
+                
+                if (prevAnim && prevAnim !== nextAnim) {
+                    prevAnim.fadeOut(0.2);
+                }
+                
+                character.currentAnimation = animName;
+                character.previousState = character.isSprinting;
+            }
+        }
+
+        function checkGrounded() {
+            const raycaster = new THREE.Raycaster(
+                character.position,
+                new THREE.Vector3(0, -1, 0),
+                0,
+                characterControls.groundDetectionRayLength
+            );
+            const intersects = raycaster.intersectObject(ground);
+            
+            character.isGrounded = intersects.length > 0;
+            if (character.isGrounded && !keys.jump) {
+                character.position.y = intersects[0].point.y + characterControls.groundOffset;
+            }
+            
+            return character.isGrounded;
+        }
+
+        function updateCameraPosition() {
+            if (!character.model) return;
+
+            const idealOffset = new THREE.Vector3(
+                0,
+                characterControls.cameraHeight,
+                characterControls.cameraDistance
+            );
+            
+            idealOffset.applyAxisAngle(new THREE.Vector3(0, 1, 0), cameraState.rotation.y);
+            idealOffset.add(character.position);
+            
+            camera.position.lerp(idealOffset, characterControls.cameraSmoothing);
+            
+            const lookAtPos = character.position.clone();
+            lookAtPos.y += characterControls.lookAtHeight;
+            
+            camera.lookAt(lookAtPos);
+            camera.rotateX(cameraState.rotation.x);
+        }
+
+        window.addEventListener('resize', () => {
+            camera.aspect = window.innerWidth / window.innerHeight;
+            camera.updateProjectionMatrix();
+            renderer.setSize(window.innerWidth, window.innerHeight);
+        });
+
+        const clock = new THREE.Clock();
+        
+        function animate() {
+            requestAnimationFrame(animate);
+            const delta = clock.getDelta();
+            
+            if (character.mixer) {
+                character.mixer.update(delta);
+            }
+            
+            if (!character.model) {
+                renderer.render(scene, camera);
+                return;
+            }
+            
+            checkGrounded();
+            
+            const forward = new THREE.Vector3(0, 0, -1);
+            forward.applyAxisAngle(new THREE.Vector3(0, 1, 0), cameraState.rotation.y);
+            forward.y = 0;
+            forward.normalize();
+            
+            const right = new THREE.Vector3();
+            right.crossVectors(new THREE.Vector3(0, 1, 0), forward);
+            right.normalize();
+            
+            let moveDirection = new THREE.Vector3();
+            if (keys.forward) moveDirection.add(forward);
+            if (keys.backward) moveDirection.sub(forward);
+            if (keys.right) moveDirection.sub(right);
+            if (keys.left) moveDirection.add(right);
+            
+            character.isMoving = moveDirection.length() > 0;
+            if (character.isMoving) {
+                moveDirection.normalize();
+                character.rotation = Math.atan2(moveDirection.x, moveDirection.z);
+                character.model.rotation.y = character.rotation;
+            }
+            
+            character.isSprinting = keys.sprint && character.isMoving;
+            
+            if (character.isMoving) {
+                const speed = characterControls.moveSpeed * 
+                    (character.isSprinting ? characterControls.sprintMultiplier : 1) * 
+                    (character.isGrounded ? 1 : characterControls.airControl);
+                
+                character.velocity.x = moveDirection.x * speed;
+                character.velocity.z = moveDirection.z * speed;
+            } else {
+                character.velocity.x *= characterControls.friction;
+                character.velocity.z *= characterControls.friction;
+            }
+            
+            if (character.isGrounded) {
+                character.velocity.y = keys.jump ? characterControls.jumpForce : 0;
+                character.isJumping = keys.jump;
+            } else {
+                character.velocity.y -= characterControls.gravity;
+            }
+            
+            character.velocity.multiplyScalar(characterControls.linearDamping);
+            character.position.add(character.velocity);
+            character.model.position.copy(character.position);
+            
+            updateCameraPosition();
+            
+            // Animation state machine
+            if (!character.isGrounded && !character.isJumping) {
+                setAnimation('FALL');
+            } else if (character.isJumping) {
+                setAnimation('JUMP');
+            } else if (character.isMoving) {
+                if (character.isSprinting && character.animations['RUN']) {
+                    setAnimation('RUN');
+                } else if (character.animations['WALK']) {
+                    setAnimation('WALK');
+                } else if (character.animations['RUN']) {
+                    setAnimation('RUN');
+                }
+            } else {
+                setAnimation('IDLE');
+            }
+            
+            renderer.render(scene, camera);
+        }
+        
+        animate();
+    </script>
+</body>
+</html>
